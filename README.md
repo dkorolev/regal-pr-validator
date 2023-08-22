@@ -1,0 +1,1 @@
+# regal-pr-validator
