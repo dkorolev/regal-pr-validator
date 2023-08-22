@@ -1,0 +1,119 @@
+name: Regal Linter
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  regal-linter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Get Regal"
+        run: |
+          curl -L -o /usr/local/bin/regal "https://github.com/StyraInc/regal/releases/latest/download/regal_Linux_x86_64"
+          chmod +x /usr/local/bin/regal
+          regal version
+      - name: "Get the code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+      - name: "Run Regal"
+        uses: actions/github-script@v6
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        with:
+          github-token: ${{ secrets.COMMENTING_GITHUB_TOKEN }}
+          script: |
+            if (context.eventName === 'pull_request') {
+              const execFileSync = require('child_process').execFileSync;
+              const re = /\.rego$/i;
+
+              let commit_sha = '';
+              if (context.payload.action === 'opened') {
+                commit_sha = context.payload.pull_request.head.sha;
+              } else if (context.payload.action === 'synchronize') {
+                commit_sha = context.payload.after;
+              }
+
+              if (commit_sha !== '') {
+                const { data: files } = await github.rest.pulls.listFiles({
+                  pull_number: context.payload.number,
+                  owner: process.env.GITHUB_REPOSITORY_OWNER,
+                  repo: context.payload.pull_request.base.repo.name
+                });
+
+                let run_regal = false;
+                let regal_args = ['lint', '-f', 'json'];
+
+                for (const f of files) {
+                  const fn = f.filename;
+                  if (fn.match(re)) {
+                    run_regal = true;
+                    regal_args.push(fn);
+                  }
+                }
+
+                let has_at_least_one_violation = false;
+
+                if (run_regal) {
+                  let regal_output = '';
+                  // NOTE(dkorolev): Grab the output of `regal` no matter its process exit code.
+                  try {
+                    regal_output = execFileSync('regal', regal_args).toString();
+                  } catch (e) {
+                    regal_output = e.stdout.toString();
+                  }
+                  const regal_output_json = JSON.parse(regal_output);
+                  if (regal_output_json) {
+                    if ('violations' in regal_output_json) {
+                      for (let v of regal_output_json.violations) {
+                        has_at_least_one_violation = true;
+                        let body = `Regal linter ${v.level}: \`${v.title}\`, `;
+                        if (v.related_resources) {
+                          body += `**[${v.description}](${v.related_resources[0].ref})**`;
+                        } else {
+                          body += `**${v.description}**`;
+                        }
+                        if (v.location.col !== 1) {
+                          body += `, on column ${v.location.col} of this line`
+                        }
+                        body += `.`;
+                        try {
+                          await github.rest.pulls.createReviewComment({
+                            pull_number: context.payload.number,
+                            owner: process.env.GITHUB_REPOSITORY_OWNER,
+                            repo: context.payload.pull_request.base.repo.name,
+                            commit_id: commit_sha,
+                            path: v.location.file,
+                            line: v.location.row,
+                            body: body
+                          });
+                      } catch(e) {
+                        // NOTE(dkorolev) - The "pull_request_review_thread.line must be part of the diff" error is OK!
+                        console.log(`EXCEPTION - ${e}.`);
+                      }
+                      }
+                    }
+                  }
+                }
+
+                if (!has_at_least_one_violation) {
+                  await github.rest.issues.createComment({
+                    issue_number: context.payload.number,
+                    repo: context.payload.pull_request.base.repo.name,
+                    owner: process.env.GITHUB_REPOSITORY_OWNER,
+                    body: 'Regal is happy, no lint warnings.'
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    issue_number: context.payload.number,
+                    repo: context.payload.pull_request.base.repo.name,
+                    owner: process.env.GITHUB_REPOSITORY_OWNER,
+                    body: 'Regal has found lint warnings in this PR.'
+                  });
+
+                  // NOTE(dkorolev): May well fail here if the policy is to force zero Regal warnings prior to merging.
+                  // process.exit(1);
+                }
+              }
+            }
