@@ -9,8 +9,4 @@ deny if {
 	not "admin" in input.user.roles
 }
 
-bad_deny if {
-	"admin" != input.user.roles[_]
-}
-
 allow if not deny
